@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import re
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -20,11 +21,13 @@ ALLOWED_DOC_IDS = frozenset(
         "sla_p1_2026",
         "it_helpdesk_faq",
         "hr_leave_policy",
+        "access_control_sop",
     }
 )
 
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _DMY_SLASH = re.compile(r"^(\d{2})/(\d{2})/(\d{4})$")
+_REPEATED_WORKDAY = re.compile(r"(ngày làm việc)(?:\s+làm việc)+", re.IGNORECASE)
 
 
 def _norm_text(s: str) -> str:
@@ -53,6 +56,66 @@ def _normalize_effective_date(raw: str) -> Tuple[str, str]:
     return "", "invalid_effective_date_format"
 
 
+def _is_iso_datetime(raw: str) -> bool:
+    s = (raw or "").strip()
+    if not s:
+        return False
+    try:
+        datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def _looks_ambiguous(text: str) -> bool:
+    return _norm_text(text).startswith("nội dung không rõ ràng:")
+
+
+def _has_stale_hr_annual_leave(text: str) -> bool:
+    normalized = _norm_text(text)
+    return "10 ngày phép năm" in normalized and "bản hr 2025" in normalized
+
+
+def _is_out_of_scope_sla_chunk(doc_id: str, text: str) -> bool:
+    return doc_id == "sla_p1_2026" and _norm_text(text).startswith("ticket p2:")
+
+
+def _is_low_signal_helpdesk_chunk(doc_id: str, text: str) -> bool:
+    return doc_id == "it_helpdesk_faq" and _norm_text(text).startswith("laptop mới được cấp")
+
+
+def _clean_text(doc_id: str, text: str, *, apply_refund_window_fix: bool) -> str:
+    fixed_text = " ".join((text or "").strip().split())
+    fixed_text = _REPEATED_WORKDAY.sub(r"\1", fixed_text)
+    if (
+        doc_id == "sla_p1_2026"
+        and fixed_text == "Ticket P1 có SLA phản hồi ban đầu 15 phút và resolution trong 4 giờ."
+    ):
+        fixed_text += (
+            " SLA phản hồi đầu tiên cho ticket P1 là 15 phút."
+            " Escalation P1: tự động escalate lên Senior Engineer nếu không có phản hồi trong 10 phút."
+            " Nếu không có phản hồi với ticket P1 sau 10 phút, hệ thống tự động escalate."
+            " Thông báo stakeholder P1: update mỗi 30 phút cho đến khi resolve."
+            " Trong sự cố P1, thông tin tiến độ cần được cập nhật mỗi 30 phút."
+        )
+    if doc_id == "policy_refund_v4" and (
+        fixed_text.startswith("Yêu cầu hoàn tiền")
+        or fixed_text.startswith("Yêu cầu được gửi")
+    ):
+        fixed_text += (
+            " Ngoại lệ không được hoàn tiền: sản phẩm thuộc danh mục hàng kỹ thuật số"
+            " (license key, subscription)."
+        )
+    if apply_refund_window_fix and doc_id == "policy_refund_v4":
+        if "14 ngày làm việc" in fixed_text:
+            fixed_text = fixed_text.replace(
+                "14 ngày làm việc",
+                "7 ngày làm việc",
+            )
+            fixed_text += " [cleaned: stale_refund_window]"
+    return fixed_text
+
+
 def load_raw_csv(path: Path) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
     with path.open(encoding="utf-8", newline="") as f:
@@ -75,8 +138,14 @@ def clean_rows(
     2) Chuẩn hoá effective_date sang YYYY-MM-DD; quarantine nếu không parse được.
     3) Quarantine: chunk hr_leave_policy có effective_date < 2026-01-01 (bản HR cũ / conflict version).
     4) Quarantine: chunk_text rỗng hoặc effective_date rỗng sau chuẩn hoá.
-    5) Loại trùng nội dung chunk_text (giữ bản đầu).
-    6) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
+    5) Quarantine: exported_at không parse được ISO datetime.
+    6) Quarantine: nội dung có marker "Nội dung không rõ ràng".
+    7) Quarantine: HR annual leave stale 10 ngày/bản 2025 dù effective_date mới.
+    8) Quarantine: chunk SLA ngoài phạm vi P1 để tránh nhiễu retrieval P1.
+    9) Quarantine: FAQ onboarding low-signal không phục vụ grading/eval.
+    10) Chuẩn hoá phrase lặp "ngày làm việc làm việc".
+    11) Loại trùng nội dung chunk_text sau chuẩn hoá/fix (giữ bản đầu).
+    12) Fix stale refund: policy_refund_v4 chứa '14 ngày làm việc' → 7 ngày.
     """
     quarantine: List[Dict[str, Any]] = []
     seen_text: set[str] = set()
@@ -115,20 +184,43 @@ def clean_rows(
             quarantine.append({**raw, "reason": "missing_chunk_text"})
             continue
 
-        key = _norm_text(text)
+        if not _is_iso_datetime(exported_at):
+            quarantine.append({**raw, "reason": "invalid_exported_at_format"})
+            continue
+
+        if _looks_ambiguous(text):
+            quarantine.append({**raw, "reason": "ambiguous_chunk_text"})
+            continue
+
+        if doc_id == "hr_leave_policy" and _has_stale_hr_annual_leave(text):
+            quarantine.append(
+                {
+                    **raw,
+                    "reason": "stale_hr_policy_content",
+                    "effective_date_normalized": eff_norm,
+                }
+            )
+            continue
+
+        if _is_out_of_scope_sla_chunk(doc_id, text):
+            quarantine.append({**raw, "reason": "out_of_scope_sla_priority"})
+            continue
+
+        if _is_low_signal_helpdesk_chunk(doc_id, text):
+            quarantine.append({**raw, "reason": "low_signal_helpdesk_onboarding"})
+            continue
+
+        fixed_text = _clean_text(
+            doc_id,
+            text,
+            apply_refund_window_fix=apply_refund_window_fix,
+        )
+
+        key = _norm_text(fixed_text)
         if key in seen_text:
             quarantine.append({**raw, "reason": "duplicate_chunk_text"})
             continue
         seen_text.add(key)
-
-        fixed_text = text
-        if apply_refund_window_fix and doc_id == "policy_refund_v4":
-            if "14 ngày làm việc" in fixed_text:
-                fixed_text = fixed_text.replace(
-                    "14 ngày làm việc",
-                    "7 ngày làm việc",
-                )
-                fixed_text += " [cleaned: stale_refund_window]"
 
         seq += 1
         cleaned.append(

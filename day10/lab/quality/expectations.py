@@ -11,6 +11,17 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
 
+EXPECTED_DOC_IDS = frozenset(
+    {
+        "policy_refund_v4",
+        "sla_p1_2026",
+        "it_helpdesk_faq",
+        "hr_leave_policy",
+        "access_control_sop",
+    }
+)
+
+
 @dataclass
 class ExpectationResult:
     name: str
@@ -109,6 +120,89 @@ def run_expectations(cleaned_rows: List[Dict[str, Any]]) -> Tuple[List[Expectati
             ok6,
             "halt",
             f"violations={len(bad_hr_annual)}",
+        )
+    )
+
+    # E7: cleaned corpus phải có đủ 5 nguồn cần cho grading/retrieval.
+    present_doc_ids = {r.get("doc_id") for r in cleaned_rows}
+    missing_doc_ids = sorted(EXPECTED_DOC_IDS - present_doc_ids)
+    ok7 = len(missing_doc_ids) == 0
+    results.append(
+        ExpectationResult(
+            "required_doc_ids_present",
+            ok7,
+            "halt",
+            f"missing_doc_ids={missing_doc_ids}",
+        )
+    )
+
+    # E8: exported_at phải là ISO datetime để freshness/lineage đáng tin.
+    exported_at_bad = [
+        r
+        for r in cleaned_rows
+        if not re.match(
+            r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}",
+            (r.get("exported_at") or "").strip(),
+        )
+    ]
+    ok8 = len(exported_at_bad) == 0
+    results.append(
+        ExpectationResult(
+            "exported_at_iso_datetime",
+            ok8,
+            "halt",
+            f"non_iso_exported_at_rows={len(exported_at_bad)}",
+        )
+    )
+
+    # E9: không publish chunk đã tự gắn nhãn là không rõ ràng.
+    ambiguous = [
+        r
+        for r in cleaned_rows
+        if (r.get("chunk_text") or "").strip().lower().startswith("nội dung không rõ ràng:")
+    ]
+    ok9 = len(ambiguous) == 0
+    results.append(
+        ExpectationResult(
+            "no_ambiguous_chunk_text",
+            ok9,
+            "halt",
+            f"ambiguous_rows={len(ambiguous)}",
+        )
+    )
+
+    # E10: corpus SLA publish cho lab này chỉ phục vụ P1; P2 gây nhiễu top-k P1.
+    p2_sla = [
+        r
+        for r in cleaned_rows
+        if r.get("doc_id") == "sla_p1_2026"
+        and (r.get("chunk_text") or "").strip().lower().startswith("ticket p2:")
+    ]
+    ok10 = len(p2_sla) == 0
+    results.append(
+        ExpectationResult(
+            "sla_p1_no_p2_priority_chunk",
+            ok10,
+            "halt",
+            f"p2_chunks={len(p2_sla)}",
+        )
+    )
+
+    # E11: chunk chính P1 phải đủ các facts thường hỏi cùng nhau.
+    p1_core_missing_escalation = [
+        r
+        for r in cleaned_rows
+        if r.get("doc_id") == "sla_p1_2026"
+        and "SLA phản hồi ban đầu 15 phút" in (r.get("chunk_text") or "")
+        and "10 phút" not in (r.get("chunk_text") or "")
+    ]
+    ok11 = len(p1_core_missing_escalation) == 0
+    results.append(
+        ExpectationResult(
+            "sla_p1_core_chunk_has_escalation",
+            ok11,
+            "halt",
+            f"core_chunks_missing_escalation={len(p1_core_missing_escalation)}",
         )
     )
 

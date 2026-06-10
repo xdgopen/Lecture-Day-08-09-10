@@ -29,15 +29,21 @@ from monitoring.freshness_check import check_manifest_freshness
 from quality.expectations import run_expectations
 from transform.cleaning_rules import clean_rows, load_raw_csv, write_cleaned_csv, write_quarantine_csv
 
-load_dotenv()
-
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 RAW_DEFAULT = ROOT / "data" / "raw" / "policy_export_dirty.csv"
 ART = ROOT / "artifacts"
 LOG_DIR = ART / "logs"
 MAN_DIR = ART / "manifests"
 QUAR_DIR = ART / "quarantine"
 CLEAN_DIR = ART / "cleaned"
+
+
+def _resolve_lab_path(raw_path: str) -> str:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return str(path)
 
 
 def _log(path: Path, line: str) -> None:
@@ -136,7 +142,7 @@ def cmd_embed_internal(cleaned_csv: Path, *, run_id: str, log) -> bool:
         log("ERROR: chromadb chưa cài. pip install -r requirements.txt")
         return False
 
-    db_path = os.environ.get("CHROMA_DB_PATH", str(ROOT / "chroma_db"))
+    db_path = _resolve_lab_path(os.environ.get("CHROMA_DB_PATH", "chroma_db"))
     collection_name = os.environ.get("CHROMA_COLLECTION", "day10_kb")
     model_name = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
