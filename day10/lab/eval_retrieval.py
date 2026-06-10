@@ -17,9 +17,15 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
-
 ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
+
+
+def _resolve_lab_path(raw_path: str) -> str:
+    path = Path(raw_path).expanduser()
+    if not path.is_absolute():
+        path = ROOT / path
+    return str(path)
 
 
 def main() -> int:
@@ -50,7 +56,7 @@ def main() -> int:
         return 1
 
     questions = json.loads(qpath.read_text(encoding="utf-8"))
-    db_path = os.environ.get("CHROMA_DB_PATH", str(ROOT / "chroma_db"))
+    db_path = _resolve_lab_path(os.environ.get("CHROMA_DB_PATH", "chroma_db"))
     collection_name = os.environ.get("CHROMA_COLLECTION", "day10_kb")
     model_name = os.environ.get("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
 
